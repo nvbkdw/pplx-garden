@@ -113,6 +113,79 @@ impl TransferEngine {
         })
     }
 
+    /// Create a TransferEngine for host memory only, without requiring GPU-NIC affinity.
+    ///
+    /// This is useful for systems where:
+    /// - GPUs and RDMA NICs are on different PCI domains
+    /// - Only host (CPU) memory transfers are needed, not GPU Direct RDMA
+    /// - You want to manually specify RDMA domains and CPU pinning
+    ///
+    /// # Arguments
+    /// * `num_domains` - Number of RDMA domains to use (will use first N available)
+    /// * `pin_worker_cpu` - CPU core to pin worker thread to
+    /// * `pin_uvm_cpu` - CPU core to pin UVM watcher thread to
+    ///
+    /// # Example
+    /// ```ignore
+    /// let engine = TransferEngine::new_host_only(1, 0, 1)?;
+    /// // Now use engine for host memory registration and transfers
+    /// ```
+    pub fn new_host_only(
+        num_domains: usize,
+        pin_worker_cpu: u16,
+        pin_uvm_cpu: u16,
+    ) -> Result<Self> {
+        use crate::efa::get_efa_domains;
+        use crate::provider_dispatch::DomainInfo;
+        use crate::verbs::{VerbsDeviceInfo, VerbsDeviceList};
+
+        // Try EFA domains first
+        let mut domains: Vec<DomainInfo> = get_efa_domains()
+            .unwrap_or_default()
+            .into_iter()
+            .map(DomainInfo::Efa)
+            .collect();
+
+        // If no EFA, try verbs (InfiniBand/RoCE)
+        if domains.is_empty() {
+            if let Ok(verbs_list) = VerbsDeviceList::get_all_devices() {
+                for i in 0..verbs_list.num_devices {
+                    let device_info = VerbsDeviceInfo::new(verbs_list.clone(), i);
+                    domains.push(DomainInfo::Verbs(device_info));
+                }
+            }
+        }
+
+        if domains.is_empty() {
+            return Err(FabricLibError::Custom(
+                "No RDMA domains found (neither EFA nor verbs). \
+                 Ensure EFA driver is loaded or InfiniBand/RoCE devices are present."
+            ));
+        }
+
+        // Limit to requested number of domains
+        let num_domains = num_domains.min(domains.len());
+        domains.truncate(num_domains);
+
+        tracing::info!(
+            "Creating host-only TransferEngine with {} domains, worker_cpu={}, uvm_cpu={}",
+            domains.len(),
+            pin_worker_cpu,
+            pin_uvm_cpu
+        );
+
+        // Create worker for host memory
+        let worker = Worker {
+            domain_list: domains,
+            pin_worker_cpu: Some(pin_worker_cpu),
+            pin_uvm_cpu: Some(pin_uvm_cpu),
+        };
+
+        // Use GPU device ID 0 as placeholder for host-only mode
+        // The FabricEngine will use Device::Host for memory registration
+        Self::new(vec![(0, worker)])
+    }
+
     pub fn num_domains(&self) -> usize {
         self.engine.num_domains()
     }

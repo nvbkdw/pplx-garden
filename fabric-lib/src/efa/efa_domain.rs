@@ -188,11 +188,19 @@ impl EfaDomain {
                 std::mem::size_of_val(&optval),
             );
             if ret != 0 {
-                return Err(LibfabricError::new(
-                    ret,
-                    "fi_setopt FI_OPT_CUDA_API_PERMITTED false",
-                )
-                .into());
+                // EOPNOTSUPP (-95) means the provider doesn't support this option
+                // This is OK for older EFA providers or host-only usage
+                if ret != -95 {
+                    return Err(LibfabricError::new(
+                        ret,
+                        "fi_setopt FI_OPT_CUDA_API_PERMITTED false",
+                    )
+                    .into());
+                }
+                tracing::debug!(
+                    "FI_OPT_CUDA_API_PERMITTED not supported by provider (error {}), continuing anyway",
+                    ret
+                );
             }
 
             // Enable endpoint
