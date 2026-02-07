@@ -29,7 +29,7 @@ pub use provider::{RdmaDomain, RdmaDomainInfo};
 pub use provider_dispatch::DomainInfo;
 pub use topo::{TopologyGroup, detect_topology};
 pub use transfer_engine::{
-    ImmCountCallback, TransferCallback, TransferEngine, UvmWatcherCallback,
+    DirectPollHandle, ImmCountCallback, TransferCallback, TransferEngine, UvmWatcherCallback,
 };
 pub use transfer_engine_builder::TransferEngineBuilder;
 pub use worker::{InitializingWorker, Worker, WorkerHandle};

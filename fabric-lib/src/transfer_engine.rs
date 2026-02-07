@@ -621,3 +621,143 @@ fn handle_transfer_completion(
         }
     }
 }
+
+/// Handle for direct polling mode (no callback threads).
+/// Application must call poll() regularly to process RDMA completions.
+pub struct DirectPollHandle {
+    engine: Arc<FabricEngine>,
+    callbacks: Arc<Callbacks>,
+}
+
+impl DirectPollHandle {
+    /// Poll for RDMA completions directly.
+    /// Call this regularly from your event loop (e.g., every 10-100µs).
+    ///
+    /// Returns the number of completions processed.
+    pub fn poll(&self) -> Result<usize> {
+        let mut count = 0;
+
+        // Poll completions from fabric engine
+        while let Some(comp) = self.engine.poll_transfer_completion() {
+            if let Err(e) = handle_transfer_completion(&self.engine, &self.callbacks, comp) {
+                error!("Error handling completion: {}", e);
+            }
+            count += 1;
+        }
+
+        Ok(count)
+    }
+
+    /// Stop the engine (cleanup resources).
+    pub fn stop(&self) {
+        self.engine.stop();
+    }
+}
+
+impl TransferEngine {
+    /// Create a TransferEngine for direct polling (no callback thread).
+    ///
+    /// The application MUST call `poll_handle.poll()` regularly to process completions.
+    /// This mode eliminates the callback thread overhead and is suitable for
+    /// integration into existing event loops (e.g., Tokio).
+    ///
+    /// # Arguments
+    /// * `num_domains` - Number of RDMA domains to use
+    /// * `pin_worker_cpu` - CPU core to pin the worker thread to
+    /// * `pin_uvm_cpu` - CPU core to pin the UVM watcher thread to
+    ///
+    /// # Returns
+    /// A tuple of (TransferEngine, DirectPollHandle).
+    /// Keep the DirectPollHandle and call poll() regularly.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let (engine, mut poll_handle) = TransferEngine::new_host_only_direct(1, 0, 1)?;
+    ///
+    /// // In your event loop:
+    /// loop {
+    ///     poll_handle.poll()?;  // Process RDMA completions
+    ///     // ... handle other events
+    /// }
+    /// ```
+    pub fn new_host_only_direct(
+        num_domains: usize,
+        pin_worker_cpu: u16,
+        pin_uvm_cpu: u16,
+    ) -> Result<(Self, DirectPollHandle)> {
+        use crate::efa::get_efa_domains;
+        use crate::provider_dispatch::DomainInfo;
+        use crate::verbs::{VerbsDeviceInfo, VerbsDeviceList};
+
+        // Try EFA domains first
+        let mut domains: Vec<DomainInfo> = get_efa_domains()
+            .unwrap_or_default()
+            .into_iter()
+            .map(DomainInfo::Efa)
+            .collect();
+
+        // If no EFA, try verbs (InfiniBand/RoCE)
+        if domains.is_empty() {
+            if let Ok(verbs_list) = VerbsDeviceList::get_all_devices() {
+                for i in 0..verbs_list.num_devices {
+                    let device_info = VerbsDeviceInfo::new(verbs_list.clone(), i);
+                    domains.push(DomainInfo::Verbs(device_info));
+                }
+            }
+        }
+
+        if domains.is_empty() {
+            return Err(FabricLibError::Custom(
+                "No RDMA domains found (neither EFA nor verbs). \
+                 Ensure EFA driver is loaded or InfiniBand/RoCE devices are present."
+            ));
+        }
+
+        // Limit to requested number of domains
+        let num_domains = num_domains.min(domains.len());
+        domains.truncate(num_domains);
+
+        tracing::info!(
+            "Creating host-only TransferEngine in DIRECT POLLING mode with {} domains, worker_cpu={}, uvm_cpu={}",
+            domains.len(),
+            pin_worker_cpu,
+            pin_uvm_cpu
+        );
+
+        // Create worker for host memory
+        let worker = Worker {
+            domain_list: domains,
+            pin_worker_cpu: Some(pin_worker_cpu),
+            pin_uvm_cpu: Some(pin_uvm_cpu),
+        };
+
+        // Create engine with workers (threads will still be created)
+        // Note: We still need the worker threads for EFA progress, but we poll
+        // the completion channel directly instead of using a callback thread
+        let workers = vec![(0, worker)];
+        let engine = Arc::new(FabricEngine::new(workers)?);
+
+        let callbacks = Arc::new(Callbacks {
+            imm: RwLock::new(Vec::new()),
+            recv_ops: DashMap::new(),
+            send_ops: DashMap::new(),
+            transfer_ops: DashMap::new(),
+            imm_count: DashMap::new(),
+            watchers: DashMap::new(),
+        });
+
+        let poll_handle = DirectPollHandle {
+            engine: engine.clone(),
+            callbacks: callbacks.clone(),
+        };
+
+        let transfer_engine = TransferEngine {
+            next_transfer_id: AtomicU64::new(0),
+            engine,
+            callbacks,
+            thread: Mutex::new(None), // No callback thread in direct mode
+        };
+
+        Ok((transfer_engine, poll_handle))
+    }
+}
